@@ -1,0 +1,60 @@
+{
+  "id": "openclaw-litefuse-plugin",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "publicKey": {
+        "type": "string",
+        "description": "Litefuse public key (single target mode)"
+      },
+      "secretKey": {
+        "type": "string",
+        "description": "Litefuse secret key (single target mode)"
+      },
+      "baseUrl": {
+        "type": "string",
+        "default": "https://litefuse.cloud",
+        "description": "Litefuse server URL"
+      },
+      "targets": {
+        "type": "array",
+        "description": "Multiple Litefuse targets (overrides publicKey/secretKey)",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string", "description": "Target display name" },
+            "publicKey": { "type": "string" },
+            "secretKey": { "type": "string" },
+            "baseUrl": { "type": "string" }
+          },
+          "required": ["publicKey", "secretKey"]
+        }
+      },
+      "tags": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["openclaw"],
+        "description": "Tags to attach to all Litefuse traces (e.g. instance name, team)"
+      },
+      "environment": {
+        "type": "string",
+        "default": "default",
+        "description": "Litefuse environment label (e.g. production, staging, development)"
+      },
+      "userId": {
+        "type": "string",
+        "description": "userId prefix on traces (e.g. 'alice' → 'alice/openclaw-tui')"
+      },
+      "debug": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable debug logging"
+      },
+      "enabledHooks": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "List of hooks to enable (if not set, all hooks are enabled)"
+      }
+    }
+  }
+}
