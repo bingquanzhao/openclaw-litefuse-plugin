@@ -1,19 +1,18 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import {
+  startObservation,
+  type LangfuseSpan,
+  type LangfuseAgent,
+  type LangfuseGeneration,
+  type LangfuseTool,
+} from "@langfuse/tracing";
+import { LangfuseOtelSpanAttributes } from "@langfuse/core";
 import { LitefuseExporter } from "./litefuse-exporter.js";
-import type { LitefusePluginConfig, TargetConfig } from "./litefuse-exporter.js";
+import type { LitefusePluginConfig } from "./litefuse-exporter.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function generateId(length = 16): string {
-  const chars = "0123456789abcdef";
-  let result = "";
-  for (let i = 0; i < length; i++) {
-    result += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return result;
-}
 
 function safeClone<T>(value: T): T {
   if (typeof globalThis.structuredClone === "function") {
@@ -76,38 +75,38 @@ function toSpecParts(content: any): any[] {
   return [{ type: "text", content: JSON.stringify(content) }];
 }
 
-function formatSystemInstructions(systemPrompt: string): string {
-  return truncateAttr(JSON.stringify([{ type: "text", content: systemPrompt }]));
-}
-
 const ROLE_MAP: Record<string, string> = {
   toolResult: "tool",
   tool_result: "tool",
   function: "tool",
 };
 
-function formatInputMessages(historyMessages: any[], userPrompt?: string): string {
-  const result = [];
+function buildInputMessages(historyMessages: any[], userPrompt?: string, systemPrompt?: string): any[] {
+  const result: any[] = [];
+  if (systemPrompt) {
+    result.push({ role: "system", content: systemPrompt });
+  }
   for (const msg of historyMessages) {
     const role = ROLE_MAP[msg.role] || msg.role;
-    result.push({ role, parts: toSpecParts(msg.content) });
+    const parts = toSpecParts(msg.content);
+    const textParts = parts.filter((p) => p.type === "text" || p.type === "reasoning");
+    const content = textParts.length
+      ? textParts.map((p) => p.content || "").join("\n")
+      : JSON.stringify(parts);
+    result.push({ role, content });
   }
   if (userPrompt) {
-    result.push({ role: "user", parts: [{ type: "text", content: userPrompt }] });
+    result.push({ role: "user", content: userPrompt });
   }
-  return truncateAttr(JSON.stringify(result));
+  return result;
 }
 
-function formatOutputMessages(assistantTexts: string[], finishReason = "stop"): string {
-  return truncateAttr(
-    JSON.stringify(
-      assistantTexts.map((text) => ({
-        role: "assistant",
-        parts: [{ type: "text", content: text }],
-        finish_reason: finishReason,
-      }))
-    )
-  );
+function buildOutputMessages(assistantTexts: string[], finishReason = "stop"): any[] {
+  return assistantTexts.map((text) => ({
+    role: "assistant",
+    content: text,
+    finish_reason: finishReason,
+  }));
 }
 
 function normalizeChannelId(input: string): string {
@@ -128,13 +127,10 @@ function resolveChannelId(ctx: Record<string, any>, eventFrom?: string): string 
 }
 
 // ---------------------------------------------------------------------------
-// Plugin implementation
+// Per-turn state
 // ---------------------------------------------------------------------------
 
-interface TraceContext {
-  traceId: string;
-  rootSpanId: string;
-  rootSpanStartTime?: number;
+interface TurnContext {
   runId: string;
   turnId: string;
   channelId: string;
@@ -142,28 +138,44 @@ interface TraceContext {
   sessionId?: string;
   userInput?: any;
   lastOutput?: any;
-  agentSpanId?: string;
+
+  // The root span carries trace-level attributes (TRACE_NAME, TRACE_USER_ID,
+  // TRACE_INPUT, etc.) and is the parent of all per-turn observations.
+  rootSpan?: LangfuseSpan;
+  rootSpanStartTime?: number;
+
+  // The agent span (when an agent runs) — parent of tool/generation spans
+  // produced during that agent's invocation.
+  agentSpan?: LangfuseAgent;
   agentStartTime?: number;
+
+  // Currently-open generation (linked to the pending llm_input/llm_output).
+  // Per-runId state lives in llmObsByRunId for late-arriving llm_output.
+  llmSpan?: LangfuseGeneration;
   llmStartTime?: number;
-  llmSpanId?: string;
-  llmSystemInstructions?: string;
-  llmInputMessages?: string;
 }
 
 interface PendingToolCall {
   toolName: string;
-  toolCallId: string;
-  toolSpanId: string;
+  toolSpan: LangfuseTool;
   toolStartTime: number;
   toolInput: any;
-  traceContext: TraceContext;
+  turnCtx: TurnContext;
   channelId: string;
 }
+
+interface LlmRunState {
+  generation: LangfuseGeneration;
+  startTime: number;
+}
+
+// ---------------------------------------------------------------------------
+// Plugin
+// ---------------------------------------------------------------------------
 
 function activate(api: OpenClawPluginApi): void {
   const pluginConfig = (api.pluginConfig || {}) as Record<string, any>;
 
-  // When using targets array, publicKey/secretKey are optional at top level
   if (!pluginConfig.targets && !pluginConfig.publicKey) {
     api.logger.error("[Litefuse] Missing required configuration: 'publicKey' or 'targets' must be provided");
     return;
@@ -186,43 +198,35 @@ function activate(api: OpenClawPluginApi): void {
   };
 
   const exporter = new LitefuseExporter(api, config);
+  const tags = config.tags || ["openclaw"];
 
-  // -- Trace context management -------------------------------------------
-  const contextByChannelId = new Map<string, TraceContext>();
-  const contextByRunId = new Map<string, TraceContext>();
+  // -- Per-turn state ------------------------------------------------------
+  const contextByChannelId = new Map<string, TurnContext>();
+  const contextByRunId = new Map<string, TurnContext>();
+  const llmObsByRunId = new Map<string, LlmRunState>();
 
   let lastUserChannelId: string | undefined;
-  let lastUserTraceContext: TraceContext | undefined;
+  let lastUserTurnContext: TurnContext | undefined;
   let pendingToolCall: PendingToolCall | undefined;
 
-  let lastLlmSystemInstructions: string | undefined;
-  let lastLlmInputMessages: string | undefined;
-  let lastLlmStartTime: number | undefined;
-  let lastLlmSpanId: string | undefined;
-
-  // Per-runId LLM timing — survives context linking failures
-  const llmTimingByRunId = new Map<string, { startTime: number; spanId: string; systemInstructions?: string; inputMessages?: string }>();
-
-  const openclawVersion = (api.config as any)?.meta?.lastTouchedVersion || (api as any).runtime?.version || "unknown";
+  const openclawVersion =
+    (api.config as any)?.meta?.lastTouchedVersion || (api as any).runtime?.version || "unknown";
 
   const shouldHookEnabled = (hookName: string): boolean => {
     if (!config.enabledHooks) return true;
     return config.enabledHooks.includes(hookName);
   };
 
+  // -- Context lookup / linking --------------------------------------------
   const getContextByChannel = (channelId: string) => contextByChannelId.get(channelId);
   const getContextByRun = (runId: string) => contextByRunId.get(runId);
-
   const getOriginalChannelId = (runId: string): string | undefined => {
     const ctx = contextByRunId.get(runId);
     return ctx?.originalChannelId || ctx?.channelId;
   };
 
-  const startTurn = (runId: string, channelId: string, originalChannelId?: string): TraceContext => {
-    const traceId = generateId(32);
-    const ctx: TraceContext = {
-      traceId,
-      rootSpanId: generateId(16),
+  const startTurn = (runId: string, channelId: string, originalChannelId?: string): TurnContext => {
+    const ctx: TurnContext = {
       runId,
       turnId: runId,
       channelId,
@@ -245,28 +249,27 @@ function activate(api: OpenClawPluginApi): void {
     rawChannelId: string,
     runId?: string,
     hookName?: string
-  ): { ctx: TraceContext; channelId: string; isNew: boolean } => {
+  ): { ctx: TurnContext; channelId: string; isNew: boolean } => {
     let channelId = rawChannelId;
-    let activeCtx: TraceContext | undefined;
+    let activeCtx: TurnContext | undefined;
 
     const effectiveRunId = runId || getContextByChannel(rawChannelId)?.runId || `run-${Date.now()}`;
 
-    // For agent events, prefer lastUserTraceContext (most recent user message)
+    // For agent events, prefer lastUserTurnContext (most recent user message)
     // over stale channelId lookups from previous conversations.
-    if (rawChannelId.startsWith("agent/") && lastUserTraceContext) {
-      activeCtx = lastUserTraceContext;
+    if (rawChannelId.startsWith("agent/") && lastUserTurnContext) {
+      activeCtx = lastUserTurnContext;
       channelId = lastUserChannelId || channelId;
       contextByChannelId.set(rawChannelId, activeCtx);
       contextByRunId.set(effectiveRunId, activeCtx);
 
       if (config.debug) {
         api.logger.info(
-          `[Litefuse] LINKING agent to user context: hook=${hookName}, agentChannel=${rawChannelId}, userChannel=${channelId}, traceId=${activeCtx.traceId}`
+          `[Litefuse] LINKING agent to user context: hook=${hookName}, agentChannel=${rawChannelId}, userChannel=${channelId}`
         );
       }
     }
 
-    // Non-agent events or no lastUserTraceContext: use channelId/runId lookup
     if (!activeCtx) {
       activeCtx = getContextByChannel(rawChannelId);
     }
@@ -283,24 +286,24 @@ function activate(api: OpenClawPluginApi): void {
       activeCtx = getContextByRun(effectiveRunId);
     }
 
-    // Fallback: link to last user trace for processing hooks.
-    // Handles platforms (e.g. TUI) where hookCtx resolves to a different
-    // channelId than the one used by message_received.
+    // Fallback: link to last user trace for processing hooks. Handles
+    // platforms (e.g. TUI) where hookCtx resolves to a different channelId
+    // than message_received used.
     if (
       !activeCtx &&
-      lastUserTraceContext &&
+      lastUserTurnContext &&
       hookName &&
       hookName !== "message_received" &&
       hookName !== "gateway_start"
     ) {
-      activeCtx = lastUserTraceContext;
+      activeCtx = lastUserTurnContext;
       channelId = lastUserChannelId || channelId;
       contextByChannelId.set(rawChannelId, activeCtx);
       contextByRunId.set(effectiveRunId, activeCtx);
 
       if (config.debug) {
         api.logger.info(
-          `[Litefuse] FALLBACK LINKING to user context: hook=${hookName}, rawChannel=${rawChannelId}, userChannel=${channelId}, traceId=${activeCtx.traceId}`
+          `[Litefuse] FALLBACK LINKING to user context: hook=${hookName}, rawChannel=${rawChannelId}, userChannel=${channelId}`
         );
       }
     }
@@ -312,191 +315,193 @@ function activate(api: OpenClawPluginApi): void {
 
       if (config.debug) {
         api.logger.info(
-          `[Litefuse] NEW TraceContext: hook=${hookName}, channelId=${channelId}, runId=${effectiveRunId}, traceId=${activeCtx.traceId}`
+          `[Litefuse] NEW TurnContext: hook=${hookName}, channelId=${channelId}, runId=${effectiveRunId}`
         );
       }
     } else if (config.debug) {
       api.logger.info(
-        `[Litefuse] REUSING TraceContext: hook=${hookName}, channelId=${channelId}, traceId=${activeCtx.traceId}`
+        `[Litefuse] REUSING TurnContext: hook=${hookName}, channelId=${channelId}`
       );
     }
 
     return { ctx: activeCtx, channelId, isNew };
   };
 
-  const createSpan = (
-    ctx: TraceContext,
-    channelId: string,
-    name: string,
-    type: string,
-    startTime: number,
-    endTime: number,
-    attributes: Record<string, any> = {},
-    input?: any,
-    output?: any,
-    parentSpanId?: string
-  ) => ({
-    name,
-    type,
-    startTime,
-    endTime,
-    attributes: {
-      ...attributes,
-      "openclaw.version": openclawVersion,
-      "openclaw.session.id": ctx.sessionId || channelId,
-      "gen_ai.session.id": ctx.sessionId || channelId,
-      "openclaw.run.id": ctx.runId,
-      "openclaw.turn.id": ctx.turnId,
-      "openclaw.channel.id": channelId,
-    },
-    input,
-    output,
-    traceId: ctx.traceId,
-    spanId: generateId(16),
-    parentSpanId: parentSpanId || ctx.rootSpanId,
-  });
-
-  const ensureEntrySpan = async (ctx: TraceContext, channelId: string, options: Record<string, any> = {}) => {
-    if (ctx.rootSpanStartTime) return;
+  // -- Root span helpers ---------------------------------------------------
+  const ensureRootSpan = (ctx: TurnContext, channelId: string, options: Record<string, any> = {}): void => {
+    if (ctx.rootSpan) return;
 
     const now = Date.now();
     ctx.rootSpanStartTime = now;
 
-    const rootSpanData = {
-      name: "enter_openclaw_system",
-      type: "entry",
-      startTime: now,
-      attributes: {
-        "gen_ai.operation.name": "enter",
-        "gen_ai.user.id": options.userId || "unknown",
-        "openclaw.session.id": ctx.sessionId || channelId,
-        "gen_ai.session.id": ctx.sessionId || channelId,
-        "openclaw.run.id": ctx.runId,
-        "openclaw.turn.id": ctx.turnId,
-        "openclaw.message.role": options.role || "unknown",
-        "openclaw.message.from": options.from || "unknown",
-        "openclaw.version": openclawVersion,
+    // Use the user message content as the initial trace-level input. Other
+    // identity fields (TRACE_NAME, TRACE_USER_ID, TRACE_SESSION_ID) are set
+    // immediately after creation since they depend on the generated traceId.
+    const span = startObservation(
+      "enter_openclaw_system",
+      {
+        input: ctx.userInput,
+        environment: config.environment,
       },
-      input: ctx.userInput,
-      traceId: ctx.traceId,
-      spanId: ctx.rootSpanId,
-    };
+      { startTime: new Date(now) }
+    );
 
-    await exporter.startSpan(rootSpanData, ctx.rootSpanId);
+    const userId = options.userId ?? "unknown";
+    const rawUserId = options.rawUserId;
+    const traceUserId = config.userId && rawUserId
+      ? `${config.userId}/${rawUserId}`
+      : config.userId || rawUserId || userId;
+
+    span.otelSpan.setAttribute(LangfuseOtelSpanAttributes.AS_ROOT, true);
+    span.otelSpan.setAttribute(
+      LangfuseOtelSpanAttributes.TRACE_NAME,
+      `openclaw-${span.traceId.slice(0, 8)}`
+    );
+    if (traceUserId) {
+      span.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_USER_ID, String(traceUserId));
+    }
+    if (ctx.sessionId) {
+      span.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_SESSION_ID, ctx.sessionId);
+    }
+    if (tags.length) {
+      span.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, tags);
+    }
+    span.otelSpan.setAttributes({
+      "gen_ai.operation.name": "enter",
+      "gen_ai.user.id": String(userId),
+      "openclaw.session.id": ctx.sessionId || channelId,
+      "openclaw.run.id": ctx.runId,
+      "openclaw.turn.id": ctx.turnId,
+      "openclaw.message.role": options.role || "unknown",
+      "openclaw.message.from": options.from || "unknown",
+      "openclaw.version": openclawVersion,
+      "openclaw.channel.id": channelId,
+    });
+
+    ctx.rootSpan = span;
 
     if (config.debug) {
-      api.logger.info(`[Litefuse] Started root span: traceId=${ctx.traceId}, spanId=${ctx.rootSpanId}`);
+      api.logger.info(`[Litefuse] Started root span: traceId=${span.traceId}, spanId=${span.id}`);
     }
   };
 
-  // -- Hook: gateway_stop -------------------------------------------------
+  const parentForChildren = (ctx: TurnContext): LangfuseSpan | LangfuseAgent | undefined => {
+    return ctx.agentSpan || ctx.rootSpan;
+  };
+
+  // -- Hooks --------------------------------------------------------------
+
   api.on("gateway_stop", async () => {
-    await exporter.dispose();
+    try {
+      await exporter.forceFlush();
+    } catch {
+      // best-effort
+    }
+    await exporter.shutdown();
   });
 
-  // -- Hook: gateway_start ------------------------------------------------
   if (shouldHookEnabled("gateway_start")) {
     api.on("gateway_start", async (event: any) => {
-      const now = Date.now();
-      const { ctx, channelId } = getOrCreateContext("system/gateway", undefined, "gateway_start");
-
-      const span = createSpan(ctx, channelId, "gateway_start", "gateway", now, now, {
-        "gateway.port": event.port || 0,
-      });
-
-      delete (span.attributes as any)["openclaw.session.id"];
-      delete (span.attributes as any)["gen_ai.session.id"];
-
-      await exporter.export(span);
+      // One-shot event with no parent context — emit as an isolated span.
+      const span = startObservation(
+        "gateway_start",
+        {
+          metadata: { "gateway.port": event.port || 0 },
+          environment: config.environment,
+        },
+        { asType: "event" }
+      );
+      span.otelSpan.setAttribute(LangfuseOtelSpanAttributes.AS_ROOT, true);
+      span.otelSpan.setAttribute(
+        LangfuseOtelSpanAttributes.TRACE_NAME,
+        `gateway-${span.traceId.slice(0, 8)}`
+      );
+      if (tags.length) {
+        span.otelSpan.setAttribute(LangfuseOtelSpanAttributes.TRACE_TAGS, tags);
+      }
+      span.otelSpan.setAttribute("openclaw.version", openclawVersion);
+      span.end();
     });
   }
 
-  // -- Hook: session_start ------------------------------------------------
   if (shouldHookEnabled("session_start")) {
     api.on("session_start", async (event: any, hookCtx: any) => {
       const rawChannelId = resolveChannelId(hookCtx, event.sessionId);
       const { ctx, channelId, isNew } = getOrCreateContext(rawChannelId, undefined, "session_start");
 
-      // Propagate sessionId to the context so later hooks (agent_end,
-      // llm_input fallbacks) can use it. Only persist it on the trace when
-      // we reused an existing context (typically the user's message_received
-      // trace, which already has userId). If we created a brand-new context,
-      // setting sessionId would produce a ghost trace — visible in the
-      // sessions list but without a user_id — which inflates session
-      // trace_count when users filter sessions by their userId.
+      // Same rationale as v3: persist sessionId on the trace only when reusing
+      // an existing user context, to avoid ghost traces with sessionId but no
+      // userId.
       if (event.sessionId) {
         ctx.sessionId = event.sessionId;
-        if (!isNew) {
-          exporter.updateTrace(ctx.traceId, { sessionId: event.sessionId });
+        if (!isNew && ctx.rootSpan) {
+          ctx.rootSpan.otelSpan.setAttribute(
+            LangfuseOtelSpanAttributes.TRACE_SESSION_ID,
+            event.sessionId
+          );
         }
       }
 
-      const now = Date.now();
-      const span = createSpan(ctx, channelId, "session_start", "session", now, now, {
-        "event.type": "session_start",
-      });
-
-      delete (span.attributes as any)["gen_ai.session.id"];
-
+      const parent = parentForChildren(ctx);
+      const evtAttrs: any = {
+        metadata: { "event.type": "session_start" },
+        environment: config.environment,
+      };
+      const opts = { asType: "event" as const };
+      const evt = parent
+        ? parent.startObservation("session_start", evtAttrs, opts)
+        : startObservation("session_start", evtAttrs, opts);
       if (event.sessionId) {
-        span.attributes["openclaw.session.id"] = event.sessionId;
+        evt.otelSpan.setAttribute("openclaw.session.id", event.sessionId);
       }
-
-      await exporter.export(span);
+      evt.end();
     });
   }
 
-  // -- Hook: session_end --------------------------------------------------
   if (shouldHookEnabled("session_end")) {
     api.on("session_end", async (event: any, hookCtx: any) => {
       const rawChannelId = resolveChannelId(hookCtx, event.sessionId);
       const { ctx, channelId, isNew } = getOrCreateContext(rawChannelId, undefined, "session_end");
 
-      // Same rationale as session_start: only persist sessionId on the trace
-      // when we reused an existing context, to avoid creating ghost traces
-      // with session_id but no user_id.
       if (event.sessionId) {
         ctx.sessionId = event.sessionId;
-        if (!isNew) {
-          exporter.updateTrace(ctx.traceId, { sessionId: event.sessionId });
+        if (!isNew && ctx.rootSpan) {
+          ctx.rootSpan.otelSpan.setAttribute(
+            LangfuseOtelSpanAttributes.TRACE_SESSION_ID,
+            event.sessionId
+          );
         }
       }
 
-      const now = Date.now();
-      const span = createSpan(
-        ctx,
-        channelId,
-        "session_end",
-        "session",
-        now,
-        now,
-        {
+      const parent = parentForChildren(ctx);
+      const evtAttrs: any = {
+        metadata: {
           "session.duration_ms": event.durationMs || 0,
           "session.message_count": event.messageCount || 0,
         },
-        undefined,
-        {
+        output: {
           messageCount: event.messageCount,
           durationMs: event.durationMs,
-        }
-      );
-
-      delete (span.attributes as any)["gen_ai.session.id"];
-
+        },
+        environment: config.environment,
+      };
+      const opts = { asType: "event" as const };
+      const evt = parent
+        ? parent.startObservation("session_end", evtAttrs, opts)
+        : startObservation("session_end", evtAttrs, opts);
       if (event.sessionId) {
-        span.attributes["openclaw.session.id"] = event.sessionId;
+        evt.otelSpan.setAttribute("openclaw.session.id", event.sessionId);
       }
+      evt.end();
 
-      await exporter.export(span);
       endTurn(channelId);
     });
   }
 
-  // -- Hook: message_received ---------------------------------------------
   if (shouldHookEnabled("message_received")) {
     api.on("message_received", async (event: any, hookCtx: any) => {
       const rawChannelId = resolveChannelId(hookCtx, event.from || event.metadata?.senderId);
-      const { ctx, channelId, isNew } = getOrCreateContext(rawChannelId, undefined, "message_received");
+      const { ctx, channelId } = getOrCreateContext(rawChannelId, undefined, "message_received");
 
       let role = event.role;
       if (!role && event.from) role = "user";
@@ -506,45 +511,41 @@ function activate(api: OpenClawPluginApi): void {
       if (isUserMessage) {
         if (!role) role = "user";
         lastUserChannelId = channelId;
-        lastUserTraceContext = ctx;
+        lastUserTurnContext = ctx;
         ctx.userInput = event.content;
 
-        await ensureEntrySpan(ctx, channelId, {
-          userId: event.from || event.metadata?.senderId,
-          role: role || "user",
+        const rawUserId = event.from || event.metadata?.senderId;
+        ensureRootSpan(ctx, channelId, {
+          userId: rawUserId || "unknown",
+          rawUserId,
+          role,
           from: event.from,
         });
 
-        // Set userId and input on trace
-        const rawUserId = event.from || event.metadata?.senderId;
-        const msgUserId = config.userId && rawUserId ? `${config.userId}/${rawUserId}` : config.userId || rawUserId;
-        exporter.updateTrace(ctx.traceId, {
-          ...(msgUserId ? { userId: String(msgUserId) } : {}),
-          input: event.content,
-        });
+        if (ctx.rootSpan) {
+          ctx.rootSpan.update({ input: event.content });
+        }
       }
     });
   }
 
-  // -- Hook: message_sending ----------------------------------------------
   if (shouldHookEnabled("message_sending")) {
-    api.on("message_sending", async (event: any, _hookCtx: any) => {
-      if (lastUserTraceContext) {
-        lastUserTraceContext.lastOutput = event.content;
+    api.on("message_sending", async (event: any, hookCtx: any) => {
+      if (lastUserTurnContext) {
+        lastUserTurnContext.lastOutput = event.content;
       } else {
-        const rawChannelId = resolveChannelId(_hookCtx, event.to);
+        const rawChannelId = resolveChannelId(hookCtx, event.to);
         const { ctx } = getOrCreateContext(rawChannelId, undefined, "message_sending");
         ctx.lastOutput = event.content;
       }
     });
   }
 
-  // -- Hook: message_sent -------------------------------------------------
   if (shouldHookEnabled("message_sent")) {
     api.on("message_sent", async (event: any, hookCtx: any) => {
       if (event.content && event.success) {
-        if (lastUserTraceContext) {
-          lastUserTraceContext.lastOutput = event.content;
+        if (lastUserTurnContext) {
+          lastUserTurnContext.lastOutput = event.content;
         } else {
           const rawChannelId = resolveChannelId(hookCtx, event.to);
           const { ctx } = getOrCreateContext(rawChannelId, undefined, "message_sent");
@@ -554,67 +555,98 @@ function activate(api: OpenClawPluginApi): void {
     });
   }
 
-  // -- Hook: llm_input ----------------------------------------------------
   if (shouldHookEnabled("llm_input")) {
     api.on("llm_input", async (event: any, hookCtx: any) => {
       const rawChannelId = resolveChannelId(hookCtx);
-      const { ctx } = getOrCreateContext(rawChannelId, event.runId, "llm_input");
+      const { ctx, channelId } = getOrCreateContext(rawChannelId, event.runId, "llm_input");
 
       if (event.sessionId) {
         ctx.sessionId = event.sessionId;
+        if (ctx.rootSpan) {
+          ctx.rootSpan.otelSpan.setAttribute(
+            LangfuseOtelSpanAttributes.TRACE_SESSION_ID,
+            event.sessionId
+          );
+        }
       }
 
-      // Update trace with sessionId and userId when available
+      // Trace-level userId from llm context, in case message_received didn't
+      // set it (e.g., agent-only invocations).
       const rawLlmUserId = hookCtx.trigger || event.from || event.metadata?.senderId || undefined;
-      const userId = config.userId && rawLlmUserId ? `${config.userId}/${rawLlmUserId}` : config.userId || rawLlmUserId;
-      exporter.updateTrace(ctx.traceId, {
-        ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
-        ...(userId ? { userId: String(userId) } : {}),
-      });
+      const userId = config.userId && rawLlmUserId
+        ? `${config.userId}/${rawLlmUserId}`
+        : config.userId || rawLlmUserId;
+      if (userId && ctx.rootSpan) {
+        ctx.rootSpan.otelSpan.setAttribute(
+          LangfuseOtelSpanAttributes.TRACE_USER_ID,
+          String(userId)
+        );
+      }
 
       if (!ctx.userInput && event.prompt) {
         ctx.userInput = event.prompt;
       }
 
-      ctx.llmStartTime = Date.now();
-      ctx.llmSpanId = generateId(16);
-
-      if (event.systemPrompt) {
-        ctx.llmSystemInstructions = formatSystemInstructions(event.systemPrompt);
-      }
-
+      const now = Date.now();
       const historyMsgs = event.historyMessages?.length
         ? event.historyMessages.map((msg: any) => safeClone(msg))
         : [];
+      const inputMessages = buildInputMessages(historyMsgs, event.prompt, event.systemPrompt);
 
-      ctx.llmInputMessages = formatInputMessages(historyMsgs, event.prompt);
+      // Truncate via the LangfuseOtelSpanAttributes path — the SDK
+      // JSON.stringifies whatever we hand it, so pre-serialize and clamp.
+      const serializedInput = truncateAttr(JSON.stringify(inputMessages));
 
-      lastLlmSystemInstructions = ctx.llmSystemInstructions;
-      lastLlmInputMessages = ctx.llmInputMessages;
-      lastLlmStartTime = ctx.llmStartTime;
-      lastLlmSpanId = ctx.llmSpanId;
+      const parent = parentForChildren(ctx);
+      const genName = `chat ${event.model || "unknown"}`;
+      const genAttrs = {
+        model: event.model || "unknown",
+        input: inputMessages,
+        environment: config.environment,
+      } as const;
+      const genOpts = { asType: "generation" as const, startTime: new Date(now) };
 
-      // Store per-runId for reliable lookup in llm_output
+      const generation = parent
+        ? parent.startObservation(genName, genAttrs, genOpts)
+        : startObservation(genName, genAttrs, genOpts);
+
+      generation.otelSpan.setAttributes({
+        "gen_ai.operation.name": "chat",
+        "gen_ai.provider.name": event.provider,
+        "gen_ai.request.model": event.model,
+        "gen_ai.response.model": event.model,
+        "openclaw.session.id": ctx.sessionId || channelId,
+        "openclaw.run.id": ctx.runId,
+        "openclaw.turn.id": ctx.turnId,
+        "openclaw.channel.id": channelId,
+        "openclaw.version": openclawVersion,
+      });
+      if (event.systemPrompt) {
+        generation.otelSpan.setAttribute(
+          "gen_ai.system_instructions",
+          truncateAttr(JSON.stringify([{ type: "text", content: event.systemPrompt }]))
+        );
+      }
+      generation.otelSpan.setAttribute("gen_ai.input.messages", serializedInput);
+
+      ctx.llmSpan = generation;
+      ctx.llmStartTime = now;
       if (event.runId) {
-        llmTimingByRunId.set(event.runId, {
-          startTime: ctx.llmStartTime,
-          spanId: ctx.llmSpanId,
-          systemInstructions: ctx.llmSystemInstructions,
-          inputMessages: ctx.llmInputMessages,
-        });
+        llmObsByRunId.set(event.runId, { generation, startTime: now });
       }
 
       if (config.debug) {
-        api.logger.info(`[Litefuse] LLM input started: ${event.provider}/${event.model}, runId=${event.runId}`);
+        api.logger.info(
+          `[Litefuse] LLM input started: ${event.provider}/${event.model}, runId=${event.runId}, spanId=${generation.id}`
+        );
       }
     });
   }
 
-  // -- Hook: llm_output ---------------------------------------------------
   if (shouldHookEnabled("llm_output")) {
     api.on("llm_output", async (event: any, hookCtx: any) => {
       const rawChannelId = resolveChannelId(hookCtx);
-      const { ctx, channelId } = getOrCreateContext(rawChannelId, event.runId, "llm_output");
+      const { ctx } = getOrCreateContext(rawChannelId, event.runId, "llm_output");
 
       if (event.sessionId) {
         ctx.sessionId = event.sessionId;
@@ -622,11 +654,19 @@ function activate(api: OpenClawPluginApi): void {
 
       const now = Date.now();
 
-      // Lookup LLM timing: ctx → global → per-runId map → fallback to now
-      const runTiming = event.runId ? llmTimingByRunId.get(event.runId) : undefined;
-      const startTime = ctx.llmStartTime || lastLlmStartTime || runTiming?.startTime || now;
+      // Resolve the generation: ctx → per-runId map. If neither exists
+      // (llm_output without prior llm_input) we silently skip — there's
+      // no anchor to end against.
+      const runState = event.runId ? llmObsByRunId.get(event.runId) : undefined;
+      const generation = ctx.llmSpan || runState?.generation;
+      if (!generation) {
+        if (config.debug) {
+          api.logger.warn(`[Litefuse] llm_output with no matching llm_input: runId=${event.runId}`);
+        }
+        return;
+      }
 
-      // Extract output text: prefer assistantTexts, fallback to lastAssistant.content
+      // Output text: prefer assistantTexts, fall back to lastAssistant.content
       let outputTexts: string[] = [];
       if (event.assistantTexts?.length) {
         outputTexts = event.assistantTexts;
@@ -642,333 +682,345 @@ function activate(api: OpenClawPluginApi): void {
       if (outputTexts.length) {
         const outputText = outputTexts.join("\n");
         ctx.lastOutput = outputText;
-
-        if (lastUserTraceContext) {
-          lastUserTraceContext.lastOutput = outputText;
+        if (lastUserTurnContext) {
+          lastUserTurnContext.lastOutput = outputText;
         }
       }
 
-      const systemInstructions = ctx.llmSystemInstructions || lastLlmSystemInstructions || runTiming?.systemInstructions;
-      const inputMessages = ctx.llmInputMessages || lastLlmInputMessages || runTiming?.inputMessages;
-      const llmSpanId = ctx.llmSpanId || lastLlmSpanId || runTiming?.spanId;
-
-      // event.usage = cumulative across all LLM calls (from getUsageTotals)
-      // lastAssistant.usage = per-call from API response (may be all zeros)
-      // Prefer event.usage as it has actual token counts when available
       const lastAssistantUsage = (event.lastAssistant as any)?.usage;
       const inputTokens = event.usage?.input ?? lastAssistantUsage?.input ?? 0;
       const outputTokens = event.usage?.output ?? lastAssistantUsage?.output ?? 0;
       const cacheReadTokens = event.usage?.cacheRead ?? lastAssistantUsage?.cacheRead ?? 0;
       const cacheCreationTokens = event.usage?.cacheWrite ?? lastAssistantUsage?.cacheWrite ?? 0;
+      const hasUsage =
+        inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0 || cacheCreationTokens > 0;
 
-      const lastAssistantObj = event.lastAssistant as any;
       const stopReason =
-        typeof lastAssistantObj?.stopReason === "string" ? lastAssistantObj.stopReason : undefined;
+        typeof event.lastAssistant?.stopReason === "string" ? event.lastAssistant.stopReason : undefined;
+      const outputMessages = outputTexts.length
+        ? buildOutputMessages(outputTexts, stopReason || "stop")
+        : undefined;
 
-      const llmAttrs: Record<string, any> = {
-        "gen_ai.operation.name": "chat",
-        "gen_ai.provider.name": event.provider,
-        "gen_ai.request.model": event.model,
-        "gen_ai.response.model": event.model,
+      const updatePayload: any = {};
+      if (outputMessages) {
+        updatePayload.output = outputMessages;
+      }
+      if (hasUsage) {
+        // Keys deliberately match Litefuse's default-model-prices.json so the
+        // server can compute cost per cache tier.
+        updatePayload.usageDetails = {
+          input: inputTokens,
+          output: outputTokens,
+          cache_read_input_tokens: cacheReadTokens,
+          cache_creation_input_tokens: cacheCreationTokens,
+        };
+      }
+      generation.update(updatePayload);
+
+      // Also stamp the OTel semantic-convention attributes that the v3
+      // implementation provided — preserves any downstream code that reads
+      // them off raw OTel spans.
+      generation.otelSpan.setAttributes({
         "gen_ai.usage.input_tokens": inputTokens,
         "gen_ai.usage.output_tokens": outputTokens,
         "gen_ai.usage.total_tokens": inputTokens + outputTokens,
         "gen_ai.usage.cache_read.input_tokens": cacheReadTokens,
         "gen_ai.usage.cache_creation.input_tokens": cacheCreationTokens,
-      };
-
+      });
       if (stopReason) {
-        llmAttrs["gen_ai.response.finish_reasons"] = JSON.stringify([stopReason]);
+        generation.otelSpan.setAttribute(
+          "gen_ai.response.finish_reasons",
+          JSON.stringify([stopReason])
+        );
+      }
+      if (outputMessages) {
+        generation.otelSpan.setAttribute(
+          "gen_ai.output.messages",
+          truncateAttr(JSON.stringify(outputMessages))
+        );
       }
 
-      if (systemInstructions) {
-        llmAttrs["gen_ai.system_instructions"] = systemInstructions;
+      generation.end(new Date(now));
+
+      // Clear pointers
+      if (ctx.llmSpan === generation) {
+        ctx.llmSpan = undefined;
+        ctx.llmStartTime = undefined;
       }
-
-      if (inputMessages) {
-        llmAttrs["gen_ai.input.messages"] = inputMessages;
-      }
-
-      if (outputTexts.length) {
-        llmAttrs["gen_ai.output.messages"] = formatOutputMessages(outputTexts, stopReason || "stop");
-      }
-
-      const span = createSpan(ctx, channelId, `chat ${event.model}`, "model", startTime, now, llmAttrs);
-
-      if (llmSpanId) span.spanId = llmSpanId;
-
-      ctx.llmStartTime = undefined;
-      ctx.llmSpanId = undefined;
-      ctx.llmSystemInstructions = undefined;
-      ctx.llmInputMessages = undefined;
-
-      lastLlmSystemInstructions = undefined;
-      lastLlmInputMessages = undefined;
-      lastLlmStartTime = undefined;
-      lastLlmSpanId = undefined;
-      if (event.runId) llmTimingByRunId.delete(event.runId);
-
-      await exporter.export(span);
+      if (event.runId) llmObsByRunId.delete(event.runId);
 
       if (config.debug) {
+        const startTime = runState?.startTime || ctx.llmStartTime || now;
         api.logger.info(
-          `[Litefuse] Exported LLM span: ${event.provider}/${event.model}, duration=${now - startTime}ms`
+          `[Litefuse] Exported LLM generation: ${event.provider}/${event.model}, duration=${now - startTime}ms`
         );
       }
     });
   }
 
-  // -- Hook: before_tool_call ---------------------------------------------
   if (shouldHookEnabled("before_tool_call")) {
     api.on("before_tool_call", async (event: any, hookCtx: any) => {
       const rawChannelId = resolveChannelId(hookCtx);
       const { ctx, channelId } = getOrCreateContext(rawChannelId, undefined, "before_tool_call");
 
+      const now = Date.now();
+      const parent = parentForChildren(ctx);
+      const toolAttrs: any = {
+        input: event.params,
+        environment: config.environment,
+      };
+      const toolOpts = { asType: "tool" as const, startTime: new Date(now) };
+      const toolSpan = parent
+        ? parent.startObservation(`execute_tool ${event.toolName}`, toolAttrs, toolOpts)
+        : startObservation(`execute_tool ${event.toolName}`, toolAttrs, toolOpts);
+
+      toolSpan.otelSpan.setAttributes({
+        "gen_ai.operation.name": "execute_tool",
+        "gen_ai.tool.name": event.toolName,
+        "gen_ai.tool.type": "function",
+        "openclaw.session.id": ctx.sessionId || channelId,
+        "openclaw.run.id": ctx.runId,
+        "openclaw.turn.id": ctx.turnId,
+        "openclaw.channel.id": channelId,
+        "openclaw.version": openclawVersion,
+      });
+      if (event.params !== undefined) {
+        toolSpan.otelSpan.setAttribute(
+          "gen_ai.tool.call.arguments",
+          truncateAttr(typeof event.params === "string" ? event.params : JSON.stringify(event.params))
+        );
+      }
+
       pendingToolCall = {
         toolName: event.toolName,
-        toolCallId: `call_${generateId(12)}`,
-        toolSpanId: generateId(16),
-        toolStartTime: Date.now(),
+        toolSpan,
+        toolStartTime: now,
         toolInput: event.params,
-        traceContext: ctx,
+        turnCtx: ctx,
         channelId,
       };
 
       if (config.debug) {
-        api.logger.info(`[Litefuse] Tool call started: ${event.toolName}, spanId=${pendingToolCall.toolSpanId}`);
+        api.logger.info(`[Litefuse] Tool call started: ${event.toolName}, spanId=${toolSpan.id}`);
       }
     });
   }
 
-  // -- Hook: after_tool_call ----------------------------------------------
   if (shouldHookEnabled("after_tool_call")) {
     api.on("after_tool_call", async (event: any, _hookCtx: any) => {
       if (!pendingToolCall || pendingToolCall.toolName !== event.toolName) {
         return;
       }
 
-      const { toolName, toolCallId, toolSpanId, toolStartTime, toolInput, traceContext, channelId } =
-        pendingToolCall;
-
+      const { toolName, toolSpan, toolStartTime } = pendingToolCall;
       pendingToolCall = undefined;
 
       const now = Date.now();
+      const durationMs = event.durationMs ?? now - toolStartTime;
 
-      const toolAttrs: Record<string, any> = {
-        "gen_ai.operation.name": "execute_tool",
-        "gen_ai.tool.name": toolName,
-        "gen_ai.tool.call.id": toolCallId,
-        "gen_ai.tool.type": "function",
-        "tool.duration_ms": event.durationMs || now - toolStartTime,
-      };
-
-      if (toolInput !== undefined) {
-        toolAttrs["gen_ai.tool.call.arguments"] = truncateAttr(
-          typeof toolInput === "string" ? toolInput : JSON.stringify(toolInput)
-        );
-      }
-
+      const updatePayload: any = {};
       if (event.error) {
-        toolAttrs["error.type"] = event.error;
+        updatePayload.level = "ERROR";
+        updatePayload.statusMessage = String(event.error);
       } else if (event.result !== undefined) {
-        toolAttrs["gen_ai.tool.call.result"] = truncateAttr(
-          typeof event.result === "string" ? event.result : JSON.stringify(event.result)
+        updatePayload.output = event.result;
+      }
+      toolSpan.update(updatePayload);
+
+      toolSpan.otelSpan.setAttribute("tool.duration_ms", durationMs);
+      if (event.error) {
+        toolSpan.otelSpan.setAttribute("error.type", String(event.error));
+      } else if (event.result !== undefined) {
+        toolSpan.otelSpan.setAttribute(
+          "gen_ai.tool.call.result",
+          truncateAttr(typeof event.result === "string" ? event.result : JSON.stringify(event.result))
         );
       }
 
-      const span = createSpan(
-        traceContext,
-        channelId,
-        `execute_tool ${toolName}`,
-        "tool",
-        toolStartTime,
-        now,
-        toolAttrs
-      );
-
-      span.spanId = toolSpanId;
-
-      await exporter.export(span);
+      toolSpan.end(new Date(now));
 
       if (config.debug) {
-        api.logger.info(
-          `[Litefuse] Exported tool span: ${toolName}, duration=${now - toolStartTime}ms`
-        );
+        api.logger.info(`[Litefuse] Exported tool span: ${toolName}, duration=${durationMs}ms`);
       }
     });
   }
 
-  // -- Hook: before_agent_start -------------------------------------------
   if (shouldHookEnabled("before_agent_start")) {
     api.on("before_agent_start", async (event: any, hookCtx: any) => {
       const rawChannelId = resolveChannelId(hookCtx);
       const agentId = hookCtx.agentId || event.agentId || "openclaw";
       const { ctx, channelId } = getOrCreateContext(rawChannelId, undefined, "before_agent_start");
 
-      await ensureEntrySpan(ctx, channelId, {
+      ensureRootSpan(ctx, channelId, {
         userId: hookCtx.trigger || "system",
         role: hookCtx.trigger || "system",
         from: agentId,
       });
 
-      if (ctx.agentSpanId) return;
+      // Only first before_agent_start per turn gets a real agent span;
+      // subsequent fires (nested agents) reuse the existing one to preserve
+      // the v3 behavior of one agent observation per turn.
+      if (ctx.agentSpan) return;
 
       const now = Date.now();
       ctx.agentStartTime = now;
-      ctx.agentSpanId = generateId(16);
 
-      const agentInput = ctx.userInput || lastUserTraceContext?.userInput;
-
-      const spanData = {
-        name: `invoke_agent ${agentId}`,
-        type: "agent",
-        startTime: now,
-        attributes: {
-          "gen_ai.operation.name": "invoke_agent",
-          "gen_ai.provider.name": "openclaw",
-          "gen_ai.agent.id": agentId,
-          "gen_ai.agent.name": agentId,
-          "openclaw.session.id": ctx.sessionId || channelId,
-          "gen_ai.session.id": ctx.sessionId || channelId,
-          "openclaw.run.id": ctx.runId,
-          "openclaw.turn.id": ctx.turnId,
-          "openclaw.version": openclawVersion,
-        },
+      const agentInput = ctx.userInput || lastUserTurnContext?.userInput;
+      const parent = ctx.rootSpan;
+      const agentAttrs: any = {
         input: agentInput,
-        traceId: ctx.traceId,
-        spanId: ctx.agentSpanId,
-        parentSpanId: ctx.rootSpanId,
+        environment: config.environment,
       };
+      const agentOpts = { asType: "agent" as const, startTime: new Date(now) };
+      const agentSpan = parent
+        ? parent.startObservation(`invoke_agent ${agentId}`, agentAttrs, agentOpts)
+        : startObservation(`invoke_agent ${agentId}`, agentAttrs, agentOpts);
 
-      await exporter.startSpan(spanData, ctx.agentSpanId);
+      agentSpan.otelSpan.setAttributes({
+        "gen_ai.operation.name": "invoke_agent",
+        "gen_ai.provider.name": "openclaw",
+        "gen_ai.agent.id": agentId,
+        "gen_ai.agent.name": agentId,
+        "openclaw.session.id": ctx.sessionId || channelId,
+        "openclaw.run.id": ctx.runId,
+        "openclaw.turn.id": ctx.turnId,
+        "openclaw.channel.id": channelId,
+        "openclaw.version": openclawVersion,
+      });
+
+      ctx.agentSpan = agentSpan;
 
       if (config.debug) {
-        api.logger.info(`[Litefuse] Started agent span: ${agentId}, spanId=${ctx.agentSpanId}`);
+        api.logger.info(`[Litefuse] Started agent span: ${agentId}, spanId=${agentSpan.id}`);
       }
     });
   }
 
-  // -- Hook: agent_end ----------------------------------------------------
   if (shouldHookEnabled("agent_end")) {
     api.on("agent_end", async (event: any, hookCtx: any) => {
       const rawChannelId = resolveChannelId(hookCtx);
       const { ctx, channelId } = getOrCreateContext(rawChannelId, undefined, "agent_end");
 
-      const now = Date.now();
+      const pendingAgentSpan = ctx.agentSpan;
+      ctx.agentSpan = undefined;
+      ctx.agentStartTime = undefined;
 
-      const pendingAgentSpanId = ctx.agentSpanId;
-      const agentEndTime = now;
+      const agentEndAttrs: Record<string, any> | undefined = pendingAgentSpan
+        ? {
+            "agent.duration_ms": event.durationMs || 0,
+            "agent.message_count": Array.isArray(event.messages) ? event.messages.length : 0,
+            "agent.success": event.success ?? true,
+            ...(event.error ? { "agent.error": event.error } : {}),
+          }
+        : undefined;
 
-      let agentEndAttrs: Record<string, any> | undefined;
-
-      if (pendingAgentSpanId) {
-        agentEndAttrs = {
-          "agent.duration_ms": event.durationMs || 0,
-          "agent.message_count": Array.isArray(event.messages) ? event.messages.length : 0,
-          "agent.success": event.success ?? true,
-          ...(event.error ? { "agent.error": event.error } : {}),
-        };
-
-        if (ctx.sessionId) {
-          agentEndAttrs["openclaw.session.id"] = ctx.sessionId || channelId;
-          agentEndAttrs["gen_ai.session.id"] = ctx.sessionId || channelId;
-        }
-
-        ctx.agentSpanId = undefined;
-        ctx.agentStartTime = undefined;
-      }
-
-      // Snapshot references — do NOT clear global pointers yet.
-      // llm_output may fire after agent_end and still needs lastUserTraceContext
-      // to link to the correct context.
-      const savedLastUserTraceContext = lastUserTraceContext;
+      // Snapshot — do NOT clear lastUserTurnContext yet. llm_output may fire
+      // after agent_end and needs to find the user context.
+      const savedLastUserTurn = lastUserTurnContext;
       const savedLastUserChannelId = lastUserChannelId;
       const originalChannelId = ctx.originalChannelId || savedLastUserChannelId || channelId;
+      const rootCtx = savedLastUserTurn || ctx;
 
-      const rootCtx = savedLastUserTraceContext || ctx;
-
-      if (rootCtx.rootSpanStartTime || pendingAgentSpanId) {
-        const rootSpanId = rootCtx.rootSpanId;
-        const rootSpanStartTime = rootCtx.rootSpanStartTime;
+      if (rootCtx.rootSpan || pendingAgentSpan) {
+        const root = rootCtx.rootSpan;
+        const rootSessionId = ctx.sessionId || rootCtx.sessionId;
         const userInput = rootCtx.userInput;
-        const traceId = rootCtx.traceId;
-        const resolvedSessionId = ctx.sessionId || rootCtx.sessionId;
 
+        // Defer agent/root end so late llm_output / message_sent events can
+        // still write to the trace before it's flushed.
         setTimeout(async () => {
           const finalOutput = ctx.lastOutput || rootCtx.lastOutput;
 
-          // Update trace input/output/sessionId
-          // NOTE: sessionId must be persisted on the trace itself so it appears
-          // in Doris traces.session_id, otherwise the trace is excluded from the
-          // sessions list (WHERE t.session_id IS NOT NULL).
-          const traceUpdates: Record<string, any> = {};
-          if (userInput) traceUpdates.input = userInput;
-          if (finalOutput) traceUpdates.output = finalOutput;
-          if (resolvedSessionId) traceUpdates.sessionId = resolvedSessionId;
-          if (Object.keys(traceUpdates).length > 0) {
-            exporter.updateTrace(rootCtx.traceId, traceUpdates);
-          }
-
-          // End agent span
-          if (pendingAgentSpanId && agentEndAttrs) {
-            if (userInput) {
-              agentEndAttrs["gen_ai.input.messages"] = truncateAttr(
-                JSON.stringify([{ role: "user", parts: [{ type: "text", content: String(userInput) }] }])
-              );
+          if (pendingAgentSpan) {
+            const agentUpdate: any = {};
+            if (userInput !== undefined) agentUpdate.input = userInput;
+            if (finalOutput !== undefined) agentUpdate.output = finalOutput;
+            pendingAgentSpan.update(agentUpdate);
+            if (agentEndAttrs) {
+              pendingAgentSpan.otelSpan.setAttributes(agentEndAttrs);
+              if (userInput !== undefined) {
+                pendingAgentSpan.otelSpan.setAttribute(
+                  "gen_ai.input.messages",
+                  truncateAttr(JSON.stringify([{ role: "user", content: String(userInput) }]))
+                );
+              }
+              if (finalOutput !== undefined) {
+                pendingAgentSpan.otelSpan.setAttribute(
+                  "gen_ai.output.messages",
+                  truncateAttr(JSON.stringify(buildOutputMessages([
+                    typeof finalOutput === "string" ? finalOutput : JSON.stringify(finalOutput),
+                  ])))
+                );
+              }
             }
-            if (finalOutput) {
-              agentEndAttrs["gen_ai.output.messages"] = formatOutputMessages([
-                typeof finalOutput === "string" ? finalOutput : JSON.stringify(finalOutput),
-              ]);
-            }
-
-            exporter.endSpanById(pendingAgentSpanId, agentEndTime, agentEndAttrs, finalOutput, userInput);
-
+            pendingAgentSpan.end();
             if (config.debug) {
               api.logger.info(
-                `[Litefuse] Ended agent span: spanId=${pendingAgentSpanId}, duration=${event.durationMs}ms`
+                `[Litefuse] Ended agent span: spanId=${pendingAgentSpan.id}, duration=${event.durationMs}ms`
               );
             }
           }
 
-          // End root span
-          if (rootSpanStartTime) {
+          if (root && rootCtx.rootSpanStartTime) {
             const endTime = Date.now();
-            const rootEndAttrs: Record<string, any> = {
-              "request.duration_ms": endTime - rootSpanStartTime,
-            };
+            // Final trace-level attributes on the root span. In OTel each
+            // span is shipped once on end(), so set everything here.
+            const rootUpdate: any = {};
+            if (userInput !== undefined) rootUpdate.input = userInput;
+            if (finalOutput !== undefined) rootUpdate.output = finalOutput;
+            root.update(rootUpdate);
 
-            if (resolvedSessionId) {
-              rootEndAttrs["openclaw.session.id"] = resolvedSessionId;
-              rootEndAttrs["gen_ai.session.id"] = resolvedSessionId;
-            }
-
-            if (userInput) {
-              rootEndAttrs["gen_ai.input.messages"] = truncateAttr(
-                JSON.stringify([{ role: "user", parts: [{ type: "text", content: String(userInput) }] }])
+            if (userInput !== undefined) {
+              root.otelSpan.setAttribute(
+                LangfuseOtelSpanAttributes.TRACE_INPUT,
+                truncateAttr(JSON.stringify(userInput))
               );
             }
-
-            if (finalOutput) {
-              rootEndAttrs["gen_ai.output.messages"] = formatOutputMessages([
-                typeof finalOutput === "string" ? finalOutput : JSON.stringify(finalOutput),
-              ]);
+            if (finalOutput !== undefined) {
+              root.otelSpan.setAttribute(
+                LangfuseOtelSpanAttributes.TRACE_OUTPUT,
+                truncateAttr(JSON.stringify(finalOutput))
+              );
+              root.otelSpan.setAttribute(
+                "gen_ai.output.messages",
+                truncateAttr(JSON.stringify(buildOutputMessages([
+                  typeof finalOutput === "string" ? finalOutput : JSON.stringify(finalOutput),
+                ])))
+              );
             }
+            if (userInput !== undefined) {
+              root.otelSpan.setAttribute(
+                "gen_ai.input.messages",
+                truncateAttr(JSON.stringify([{ role: "user", content: String(userInput) }]))
+              );
+            }
+            if (rootSessionId) {
+              root.otelSpan.setAttribute(
+                LangfuseOtelSpanAttributes.TRACE_SESSION_ID,
+                rootSessionId
+              );
+              root.otelSpan.setAttribute("openclaw.session.id", rootSessionId);
+            }
+            root.otelSpan.setAttribute(
+              "request.duration_ms",
+              endTime - rootCtx.rootSpanStartTime
+            );
 
-            exporter.endSpanById(rootSpanId, endTime, rootEndAttrs, finalOutput, userInput);
+            root.end(new Date(endTime));
+            rootCtx.rootSpan = undefined;
+            rootCtx.rootSpanStartTime = undefined;
 
             if (config.debug) {
               api.logger.info(
-                `[Litefuse] Ended root span: spanId=${rootSpanId}, duration=${endTime - rootSpanStartTime}ms, traceId=${traceId}`
+                `[Litefuse] Ended root span: spanId=${root.id}, duration=${endTime - (rootCtx.rootSpanStartTime || endTime)}ms, traceId=${root.traceId}`
               );
             }
           }
 
-          // Clear global pointers (deferred to allow llm_output to use them)
+          // Clear global pointers (deferred — see comment above)
           lastUserChannelId = undefined;
-          lastUserTraceContext = undefined;
+          lastUserTurnContext = undefined;
 
-          // Clean up Map entries
           if (savedLastUserChannelId) endTurn(savedLastUserChannelId);
           if (originalChannelId && originalChannelId !== savedLastUserChannelId) {
             endTurn(originalChannelId);
@@ -977,14 +1029,14 @@ function activate(api: OpenClawPluginApi): void {
             contextByChannelId.delete(rawChannelId);
           }
 
-          // Wait for SDK batch queue to process end() events before flushing
-          await new Promise(r => setTimeout(r, 500));
-          await exporter.flush();
-          exporter.endTrace();
+          // Let the OTel BatchSpanProcessor drain its in-memory queue before
+          // forcing a flush. Mirrors the v3 500ms wait before flushAsync.
+          await new Promise((r) => setTimeout(r, 500));
+          await exporter.forceFlush();
         }, 200);
       } else {
         lastUserChannelId = undefined;
-        lastUserTraceContext = undefined;
+        lastUserTurnContext = undefined;
         if (savedLastUserChannelId) endTurn(savedLastUserChannelId);
         if (originalChannelId && originalChannelId !== savedLastUserChannelId) {
           endTurn(originalChannelId);
@@ -992,8 +1044,7 @@ function activate(api: OpenClawPluginApi): void {
         if (rawChannelId !== originalChannelId && rawChannelId !== savedLastUserChannelId) {
           contextByChannelId.delete(rawChannelId);
         }
-        await exporter.flush();
-        exporter.endTrace();
+        await exporter.forceFlush();
       }
     });
   }
@@ -1004,14 +1055,14 @@ function activate(api: OpenClawPluginApi): void {
 }
 
 // ---------------------------------------------------------------------------
-// Plugin definition — this is the object openclaw's plugin loader expects
+// Plugin definition
 // ---------------------------------------------------------------------------
 
 const plugin = {
   id: "openclaw-litefuse-plugin",
   name: "OpenClaw Litefuse Plugin",
-  version: "0.2.0",
-  description: "Report OpenClaw AI agent execution traces to Litefuse",
+  version: "0.3.0",
+  description: "Report OpenClaw AI agent execution traces to Litefuse (OTel-based)",
 
   configSchema: {
     type: "object",
@@ -1055,6 +1106,10 @@ const plugin = {
         type: "string",
         default: "default",
         description: "Litefuse environment label (e.g. production, staging, development)",
+      },
+      userId: {
+        type: "string",
+        description: "userId prefix on traces (e.g. 'alice' → 'alice/openclaw-tui')",
       },
       debug: {
         type: "boolean",
